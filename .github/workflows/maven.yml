@@ -11,63 +11,79 @@ on:
 
 jobs:
   build:
-
+      
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v2
-    - name: Set up JDK 1.8
-      uses: actions/setup-java@v1
+    - name: Set up JDK 11
+      uses: actions/setup-java@v2
       with:
-        java-version: '1.8'
-        distribution: 'temurin'
+        java-version: '11'
+        distribution: 'adopt'
         cache: maven
-    - name: Build with Maven
-      run: mvn clean install
-
-
-    - name: Build & push Docker image
-      uses: mr-smithers-excellent/docker-build-push@v5  
+        
+    - name: Cache SonarQube packages
+      uses: actions/cache@v1
       with:
-        image: 22101989/devops-homework
-        tags: latest
-        registry: docker.io
-        username: ${{ secrets.DOCKER_USERNAME }}
-        password: ${{ secrets.DOCKER_PASSWORD }}
+        path: ~/.sonar/cache
+        key: ${{ runner.os }}-sonar
+        restore-keys: ${{ runner.os }}-sonar
+    - name: Cache Maven packages
+      uses: actions/cache@v1
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+        restore-keys: ${{ runner.os }}-m2
         
+    - name: Build and analyze
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      run: mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar
         
-  deploy:
-    needs: build
-    
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: Checkout files
-        uses: actions/checkout@v2
-        
-      - name: Install doctl
-        uses: digitalocean/action-doctl@v2
-        with:
-          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
-          
-      #To make sure that application always available
-      - name: Check if server exist
-        run: doctl compute droplet get weather-server
-        
-      #- name: Create weather-server if NOT exist, If EXIST remove it and create new
-      - if: ${{ failure() }}
-        name: Create new servers
-        run: |
-          doctl compute droplet create weather-server --image docker-18-04 --tag-name weather-app --size s-1vcpu-1gb --region nyc1 --user-data-file create-app.sh --wait
-          doctl compute droplet create weather-server-2 --image docker-18-04 --tag-name weather-app --size s-1vcpu-1gb --region nyc1 --user-data-file create-app.sh --wait
-      - if: ${{ success() }}
-        name: If exist, remove and create new with 5 minutes delay.
-        run: | 
-          doctl compute droplet delete weather-server -f
-          doctl compute droplet create weather-server --image docker-18-04 --tag-name weather-app --size s-1vcpu-1gb --region nyc1 --user-data-file create-app.sh --wait
-          sleep 300
-          doctl compute droplet delete weather-server-2 -f
-          doctl compute droplet create weather-server-2 --image docker-18-04 --tag-name weather-app --size s-1vcpu-1gb --region nyc1 --user-data-file create-app.sh --wait
-          exit 0
+    - name: Unit test
+      run: mvn test --file pom.xml
       
-    
+    - name: Build with Maven
+      run: mvn clean package --file pom.xml
+      
+    - name: Login to DockerHub
+      uses: docker/login-action@v1
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: push to docker hub
+      uses: docker/build-push-action@v2
+      with:
+        context: .
+        push: true
+        tags: ahmedrabie90/weather_demo_devops:${{ github.run_number }}
+
+    - name: Update  yaml File with A new Tag
+      env:
+         IMAGE_VERSION: ${{ github.run_number }} 
+      run: |
+        sed "s/IMAGE_VERSION/$IMAGE_VERSION/g"  kubernetes/weather.yaml > kubernetes/new_weather_image.yaml
+        cat kubernetes/new_weather_image.yaml
+    - name: Create deployment
+      uses: Eyevinn/action-eks-kubectl@master
+      env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          IMAGE_VERSION: ${{ github.run_number }}          
+          REGION: us-east-1
+          CLUSTER: demo
+      with:
+        args: apply -f kubernetes/new_weather_image.yaml
+          
+    - name: Get list of Services 
+      uses: Eyevinn/action-eks-kubectl@master
+      env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          REGION: us-east-1
+          CLUSTER: demo    
+      with:
+        args: get  svc
